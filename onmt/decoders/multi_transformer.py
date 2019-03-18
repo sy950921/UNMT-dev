@@ -78,7 +78,7 @@ class MultiTransformerDecoder(DecoderBase):
         for k in range(num_layers):
             layer_is_shared = (k < share_dec)
 
-            self.transformer.append(nn.ModuleList([
+            self.transformer_layers.append(nn.ModuleList([
                 MultiTransformerDecoderLayer(d_model, heads, d_ff, dropout,
                                              max_relative_positions=max_relative_positions)
             ]))
@@ -178,7 +178,7 @@ class MultiTransformerDecoder(DecoderBase):
 
         for i, layer in enumerate(self.transformer_layers):
             layer_cache = {"memory_keys": None, "memory_values": None}
-            if isinstance(layer.self_attn, AverageAttention):
+            if isinstance(layer[0].self_attn, AverageAttention):
                 layer_cache["prev_g"] = torch.zeros((batch_size, 1, depth))
             else:
                 layer_cache["self_keys"] = None

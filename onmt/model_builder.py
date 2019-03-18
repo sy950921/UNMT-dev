@@ -66,12 +66,35 @@ def build_encoder(opt, embeddings):
     return str2enc[enc_type].from_opt(opt, embeddings)
 
 
+def build_multi_encoder(opt, embeddings):
+    """
+    Various encoder dispatcher function.
+    Args:
+        opt: the option in current environment.
+        embeddings (ModuleList): vocab embeddings for this encoder.
+    """
+    enc_type = opt.encoder_type if opt.model_type == "text" else opt.model_type
+    return str2enc[enc_type].from_opt(opt, embeddings)
+
+
 def build_decoder(opt, embeddings):
     """
     Various decoder dispatcher function.
     Args:
         opt: the option in current environment.
         embeddings (Embeddings): vocab embeddings for this decoder.
+    """
+    dec_type = "ifrnn" if opt.decoder_type == "rnn" and opt.input_feed \
+               else opt.decoder_type
+    return str2dec[dec_type].from_opt(opt, embeddings)
+
+
+def build_multi_decoder(opt, embeddings):
+    """
+    Various decoder dispatcher function.
+    Args:
+        opt: the option in current environment.
+        embeddings (ModuleList): vocab embeddings for this decoder.
     """
     dec_type = "ifrnn" if opt.decoder_type == "rnn" and opt.input_feed \
                else opt.decoder_type
@@ -220,8 +243,142 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None, gpu_id=None):
     return model
 
 
+def build_multi_model(model_opt, fields, gpu, checkpoint=None, gpu_id=None):
+    """Build a model from opts.
+
+    Args:
+        model_opt: the option loaded from checkpoint. It's important that
+            the opts have been updated and validated. See
+            :class:`onmt.utils.parse.ArgumentParser`.
+        fields (dict[str, torchtext.data.Field]):
+            `Field` objects for the model.
+        gpu (bool): whether to use gpu.
+        checkpoint: the model gnerated by train phase, or a resumed snapshot
+                    model from a stopped training.
+        gpu_id (int or NoneType): Which GPU to use.
+
+    Returns:
+        the NMTModel.
+    """
+
+    # Build embeddings.
+    emb = []
+    for lang in model_opt.langs:
+        field = fields[lang]
+        lang_emb = build_embeddings(model_opt, field)
+        emb.append(lang_emb)
+    src_emb = nn.ModuleList(emb)
+
+    # Build encoder.
+    encoder = build_multi_encoder(model_opt, src_emb)
+
+    # Build decoder.
+    emb = []
+    for lang in model_opt.langs:
+        field = fields[lang]
+        lang_emb = build_embeddings(model_opt, field, for_encoder=False)
+        emb.append(lang_emb)
+    tgt_emb = nn.ModuleList(emb)
+    decoder = build_multi_decoder(model_opt, tgt_emb)
+
+    # Build NMTModel(= encoder + decoder).
+    if gpu and gpu_id is not None:
+        device = torch.device("cuda", gpu_id)
+    elif gpu and not gpu_id:
+        device = torch.device("cuda")
+    elif not gpu:
+        device = torch.device("cpu")
+    model = onmt.models.MultiNMTModel(encoder, decoder)
+
+    # Build Generator.
+    if not model_opt.copy_attn:
+        if model_opt.generator_function == "sparsemax":
+            gen_func = onmt.modules.sparse_activations.LogSparsemax(dim=-1)
+        else:
+            gen_func = nn.LogSoftmax(dim=-1)
+
+        generator = []
+        for lang in model_opt.langs:
+            gener = nn.Sequential(
+                nn.Linear(model_opt.dec_rnn_size,
+                          len(fields[lang].base_field.vocab)),
+                Cast(torch.float32),
+                gen_func
+            )
+            generator.append(gener)
+        generator = nn.ModuleList(generator)
+        # generator = nn.Sequential(
+        #     nn.Linear(model_opt.dec_rnn_size,
+        #               len(fields["tgt"].base_field.vocab)),
+        #     Cast(torch.float32),
+        #     gen_func
+        # )
+        # if model_opt.share_decoder_embeddings:
+        #     generator[0].weight = decoder.embeddings.word_lut.weight
+    else:
+        generator = []
+        for lang in model_opt.langs:
+            tgt_base_field = fields[lang].base_field
+            vocab_size = len(tgt_base_field.vocab)
+            pad_idx = tgt_base_field.vocab.stoi[tgt_base_field.pad_token]
+            gener = CopyGenerator(model_opt.dec_rnn_size, vocab_size, pad_idx)
+            generator.append(gener)
+        generator = nn.ModuleList(generator)
+
+    # Load the model states from checkpoint or initialize them.
+    if checkpoint is not None:
+        # This preserves backward-compat for models using customed layernorm
+        def fix_key(s):
+            s = re.sub(r'(.*)\.layer_norm((_\d+)?)\.b_2',
+                       r'\1.layer_norm\2.bias', s)
+            s = re.sub(r'(.*)\.layer_norm((_\d+)?)\.a_2',
+                       r'\1.layer_norm\2.weight', s)
+            return s
+
+        checkpoint['model'] = {fix_key(k): v
+                               for k, v in checkpoint['model'].items()}
+        # end of patch for backward compatibility
+
+        model.load_state_dict(checkpoint['model'], strict=False)
+        generator.load_state_dict(checkpoint['generator'], strict=False)
+    else:
+        if model_opt.param_init != 0.0:
+            for p in model.parameters():
+                p.data.uniform_(-model_opt.param_init, model_opt.param_init)
+            for p in generator.parameters():
+                p.data.uniform_(-model_opt.param_init, model_opt.param_init)
+        if model_opt.param_init_glorot:
+            for p in model.parameters():
+                if p.dim() > 1:
+                    xavier_uniform_(p)
+            for p in generator.parameters():
+                if p.dim() > 1:
+                    xavier_uniform_(p)
+
+        # if hasattr(model.encoder, 'embeddings'):
+        #     model.encoder.embeddings.load_pretrained_vectors(
+        #         model_opt.pre_word_vecs_enc)
+        # if hasattr(model.decoder, 'embeddings'):
+        #     model.decoder.embeddings.load_pretrained_vectors(
+        #         model_opt.pre_word_vecs_dec)
+
+    model.generator = generator
+    model.to(device)
+    if model_opt.model_dtype == 'fp16':
+        model.half()
+
+    return model
+
+
 def build_model(model_opt, opt, fields, checkpoint):
     logger.info('Building model...')
     model = build_base_model(model_opt, fields, use_gpu(opt), checkpoint)
+    logger.info(model)
+    return model
+
+
+def build_multi_model(model_opt, opt, fields, checkpoint):
+    logger.info('Building multi-translation model...')
+    model = build_multi_model(model_opt, fields, use_gpu(opt), checkpoint)
     logger.info(model)
     return model
